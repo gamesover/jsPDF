@@ -1,7 +1,7 @@
 /** @license
  *
  * jsPDF - PDF Document creation from JavaScript
- * Version 2.3.1 Built on 2021-03-08T15:44:11.674Z
+ * Version 2.3.1 Built on 2021-08-10T00:21:13.794Z
  *                      CommitID 00000000
  *
  * Copyright (c) 2010-2020 James Hall <james@parall.ax>, https://github.com/MrRio/jsPDF
@@ -777,8 +777,55 @@ PDFSecurity.prototype.encryptor = function(objectId, generation) {
   };
 };
 
-/* eslint-disable no-console */
+/**
+ * Convert string to `PDF Name Object`.
+ * Detail: PDF Reference 1.3 - Chapter 3.2.4 Name Object
+ * @param str
+ */
+function toPDFName(str) {
+  // eslint-disable-next-line no-control-regex
+  if (/[^\u0000-\u00ff]/.test(str)) {
+    // non ascii string
+    throw new Error(
+      "Invalid PDF Name Object: " + str + ", Only accept ASCII characters."
+    );
+  }
+  var result = "",
+    strLength = str.length;
+  for (var i = 0; i < strLength; i++) {
+    var charCode = str.charCodeAt(i);
+    if (
+      charCode < 0x21 ||
+      charCode === 0x23 /* # */ ||
+      charCode === 0x25 /* % */ ||
+      charCode === 0x28 /* ( */ ||
+      charCode === 0x29 /* ) */ ||
+      charCode === 0x2f /* / */ ||
+      charCode === 0x3c /* < */ ||
+      charCode === 0x3e /* > */ ||
+      charCode === 0x5b /* [ */ ||
+      charCode === 0x5d /* ] */ ||
+      charCode === 0x7b /* { */ ||
+      charCode === 0x7d /* } */ ||
+      charCode > 0x7e
+    ) {
+      // Char    CharCode    hexStr   paddingHexStr    Result
+      // "\t"    9           9        09               #09
+      // " "     32          20       20               #20
+      // "©"     169         a9       a9               #a9
+      var hexStr = charCode.toString(16),
+        paddingHexStr = ("0" + hexStr).slice(-2);
 
+      result += "#" + paddingHexStr;
+    } else {
+      // Other ASCII printable characters between 0x21 <= X <= 0x7e
+      result += str[i];
+    }
+  }
+  return result;
+}
+
+/* eslint-disable no-console */
 /**
  * jsPDF's Internal PubSub Implementation.
  * Backward compatible rewritten on 2014 by
@@ -2767,26 +2814,18 @@ function jsPDF(options) {
   });
 
   var putFont = function(font) {
-    var pdfEscapeWithNeededParanthesis = function(text, flags) {
-      var addParanthesis = text.indexOf(" ") !== -1; // no space in string
-      return addParanthesis
-        ? "(" + pdfEscape(text, flags) + ")"
-        : pdfEscape(text, flags);
-    };
-
     events.publish("putFont", {
       font: font,
       out: out,
       newObject: newObject,
-      putStream: putStream,
-      pdfEscapeWithNeededParanthesis: pdfEscapeWithNeededParanthesis
+      putStream: putStream
     });
 
     if (font.isAlreadyPutted !== true) {
       font.objectNumber = newObject();
       out("<<");
       out("/Type /Font");
-      out("/BaseFont /" + pdfEscapeWithNeededParanthesis(font.postScriptName));
+      out("/BaseFont /" + toPDFName(font.postScriptName));
       out("/Subtype /Type1");
       if (typeof font.encoding === "string") {
         out("/Encoding /" + font.encoding);
@@ -4631,6 +4670,8 @@ function jsPDF(options) {
                 )
               )
             );
+          } else {
+            wordSpacingPerLine.push(0);
           }
           text.push([da[l], newX, newY]);
         }
@@ -6448,7 +6489,10 @@ function jsPDF(options) {
 
   var endFormObject = function(key) {
     // only add it if it is not already present (the keys provided by the user must be unique!)
-    if (renderTargetMap[key]) return;
+    if (renderTargetMap[key]) {
+      renderTargetStack.pop().restore();
+      return;
+    }
 
     // save the created xObject
     var newXObject = new RenderTarget();
@@ -9928,6 +9972,11 @@ var AcroForm = jsPDF.AcroForm;
 
   var UNKNOWN = "UNKNOWN";
 
+  // Heuristic selection of a good batch for large array .apply. Not limiting make the call overflow.
+  // With too small batch iteration will be slow as more calls are made,
+  // higher values cause larger and slower garbage collection.
+  var ARRAY_APPLY_BATCH = 8192;
+
   var imageFileTypeHeaders = {
     PNG: [[0x89, 0x50, 0x4e, 0x47]],
     TIFF: [
@@ -10266,6 +10315,14 @@ var AcroForm = jsPDF.AcroForm;
     }
 
     if (element.nodeName === "CANVAS") {
+      if (element.width === 0 || element.height === 0) {
+        throw new Error(
+          "Given canvas must have data. Canvas width: " +
+            element.width +
+            ", height: " +
+            element.height
+        );
+      }
       var mimeType;
       switch (format) {
         case "PNG":
@@ -10608,27 +10665,27 @@ var AcroForm = jsPDF.AcroForm;
    * @name arrayBufferToBinaryString
    * @public
    * @function
-   * @param {ArrayBuffer} ArrayBuffer with ImageData
+   * @param {ArrayBuffer|ArrayBufferView} ArrayBuffer buffer or bufferView with ImageData
    *
    * @returns {String}
    */
   var arrayBufferToBinaryString = (jsPDFAPI.__addimage__.arrayBufferToBinaryString = function(
     buffer
   ) {
-    try {
-      return atob(btoa(String.fromCharCode.apply(null, buffer)));
-    } catch (e) {
-      if (
-        typeof Uint8Array !== "undefined" &&
-        typeof Uint8Array.prototype.reduce !== "undefined"
-      ) {
-        return new Uint8Array(buffer)
-          .reduce(function(data, byte) {
-            return data.push(String.fromCharCode(byte)), data;
-          }, [])
-          .join("");
-      }
+    var out = "";
+    // There are calls with both ArrayBuffer and already converted Uint8Array or other BufferView.
+    // Do not copy the array if input is already an array.
+    var buf = isArrayBufferView(buffer) ? buffer : new Uint8Array(buffer);
+    for (var i = 0; i < buf.length; i += ARRAY_APPLY_BATCH) {
+      // Limit the amount of characters being parsed to prevent overflow.
+      // Note that while TextDecoder would be faster, it does not have the same
+      // functionality as fromCharCode with any provided encodings as of 3/2021.
+      out += String.fromCharCode.apply(
+        null,
+        buf.subarray(i, i + ARRAY_APPLY_BATCH)
+      );
     }
+    return out;
   });
 
   /**
@@ -12238,7 +12295,10 @@ var AcroForm = jsPDF.AcroForm;
       });
     }
 
-    if (autoSize || (Array.isArray(headers) && typeof headers[0] === "string")) {
+    if (
+      autoSize ||
+      (Array.isArray(headers) && typeof headers[0] === "string")
+    ) {
       var headerName;
       for (i = 0; i < headerNames.length; i += 1) {
         headerName = headerNames[i];
@@ -12863,6 +12923,8 @@ function parseFontFamily(input) {
     this.currentPoint = ctx.currentPoint || new Point();
     this.miterLimit = ctx.miterLimit || 10.0;
     this.lastPoint = ctx.lastPoint || new Point();
+    this.lineDashOffset = ctx.lineDashOffset || 0.0;
+    this.lineDash = ctx.lineDash || [];
 
     this.ignoreClearRect =
       typeof ctx.ignoreClearRect === "boolean" ? ctx.ignoreClearRect : true;
@@ -13453,6 +13515,33 @@ function parseFontFamily(input) {
       }
     });
 
+    /**
+     * A float specifying the amount of the line dash offset. The default value is 0.0.
+     *
+     * @name lineDashOffset
+     * @default 0.0
+     */
+    Object.defineProperty(this, "lineDashOffset", {
+      get: function() {
+        return this.ctx.lineDashOffset;
+      },
+      set: function(value) {
+        this.ctx.lineDashOffset = value;
+        setLineDash.call(this);
+      }
+    });
+
+    // Not HTML API
+    Object.defineProperty(this, "lineDash", {
+      get: function() {
+        return this.ctx.lineDash;
+      },
+      set: function(value) {
+        this.ctx.lineDash = value;
+        setLineDash.call(this);
+      }
+    });
+
     // Not HTML API
     Object.defineProperty(this, "ignoreClearRect", {
       get: function() {
@@ -13462,6 +13551,32 @@ function parseFontFamily(input) {
         this.ctx.ignoreClearRect = Boolean(value);
       }
     });
+  };
+
+  /**
+   * Sets the line dash pattern used when stroking lines.
+   * @name setLineDash
+   * @function
+   * @description It uses an array of values that specify alternating lengths of lines and gaps which describe the pattern.
+   */
+  Context2D.prototype.setLineDash = function(dashArray) {
+    this.lineDash = dashArray;
+  };
+
+  /**
+   * gets the current line dash pattern.
+   * @name getLineDash
+   * @function
+   * @returns {Array} An Array of numbers that specify distances to alternately draw a line and a gap (in coordinate space units). If the number, when setting the elements, is odd, the elements of the array get copied and concatenated. For example, setting the line dash to [5, 15, 25] will result in getting back [5, 15, 25, 5, 15, 25].
+   */
+  Context2D.prototype.getLineDash = function() {
+    if (this.lineDash.length % 2) {
+      // https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/getLineDash#return_value
+      return this.lineDash.concat(this.lineDash);
+    } else {
+      // The copied value is returned to prevent contamination from outside.
+      return this.lineDash.slice();
+    }
   };
 
   Context2D.prototype.fill = function() {
@@ -13917,6 +14032,8 @@ function parseFontFamily(input) {
       this.lineCap = this.ctx.lineCap;
       this.lineWidth = this.ctx.lineWidth;
       this.lineJoin = this.ctx.lineJoin;
+      this.lineDash = this.ctx.lineDash;
+      this.lineDashOffset = this.ctx.lineDashOffset;
     }
   };
 
@@ -14494,7 +14611,7 @@ function parseFontFamily(input) {
     var strokeStyle = this.strokeStyle;
     var lineCap = this.lineCap;
     var oldLineWidth = this.lineWidth;
-    var lineWidth = oldLineWidth * this.ctx.transform.scaleX;
+    var lineWidth = Math.abs(oldLineWidth * this.ctx.transform.scaleX);
     var lineJoin = this.lineJoin;
 
     var origPath = JSON.parse(JSON.stringify(this.path));
@@ -15152,6 +15269,34 @@ function parseFontFamily(input) {
       Math.round(maxx - minx),
       Math.round(maxy - miny)
     );
+  };
+
+  var getPrevLineDashValue = function(lineDash, lineDashOffset) {
+    return JSON.stringify({
+      lineDash: lineDash,
+      lineDashOffset: lineDashOffset
+    });
+  };
+
+  var setLineDash = function() {
+    // Avoid unnecessary line dash declarations.
+    if (
+      !this.prevLineDash &&
+      !this.ctx.lineDash.length &&
+      !this.ctx.lineDashOffset
+    ) {
+      return;
+    }
+
+    // Avoid unnecessary line dash declarations.
+    const nextLineDash = getPrevLineDashValue(
+      this.ctx.lineDash,
+      this.ctx.lineDashOffset
+    );
+    if (this.prevLineDash !== nextLineDash) {
+      this.pdf.setLineDash(this.ctx.lineDash, this.ctx.lineDashOffset);
+      this.prevLineDash = nextLineDash;
+    }
   };
 })(jsPDF.API);
 
@@ -25632,7 +25777,7 @@ WebPDecoder.prototype.getData = function() {
       lv: "Latvian",
       lt: "Lithuanian",
       lb: "Luxembourgish",
-      mk: "FYRO Macedonian",
+      mk: "North Macedonia",
       ms: "Malay",
       ml: "Malayalam",
       mt: "Maltese",
@@ -27287,7 +27432,6 @@ WebPDecoder.prototype.getData = function() {
     var out = options.out;
     var newObject = options.newObject;
     var putStream = options.putStream;
-    var pdfEscapeWithNeededParanthesis = options.pdfEscapeWithNeededParanthesis;
 
     if (
       font.metadata instanceof jsPDF.API.TTFFont &&
@@ -27313,7 +27457,7 @@ WebPDecoder.prototype.getData = function() {
       var fontDescriptor = newObject();
       out("<<");
       out("/Type /FontDescriptor");
-      out("/FontName /" + pdfEscapeWithNeededParanthesis(font.fontName));
+      out("/FontName /" + toPDFName(font.fontName));
       out("/FontFile2 " + fontTable + " 0 R");
       out("/FontBBox " + jsPDF.API.PDFObject.convert(font.metadata.bbox));
       out("/Flags " + font.metadata.flags);
@@ -27328,7 +27472,7 @@ WebPDecoder.prototype.getData = function() {
       var DescendantFont = newObject();
       out("<<");
       out("/Type /Font");
-      out("/BaseFont /" + pdfEscapeWithNeededParanthesis(font.fontName));
+      out("/BaseFont /" + toPDFName(font.fontName));
       out("/FontDescriptor " + fontDescriptor + " 0 R");
       out("/W " + jsPDF.API.PDFObject.convert(widths));
       out("/CIDToGIDMap /Identity");
@@ -27348,7 +27492,7 @@ WebPDecoder.prototype.getData = function() {
       out("/Type /Font");
       out("/Subtype /Type0");
       out("/ToUnicode " + cmap + " 0 R");
-      out("/BaseFont /" + pdfEscapeWithNeededParanthesis(font.fontName));
+      out("/BaseFont /" + toPDFName(font.fontName));
       out("/Encoding /" + font.encoding);
       out("/DescendantFonts [" + DescendantFont + " 0 R]");
       out(">>");
@@ -27370,7 +27514,6 @@ WebPDecoder.prototype.getData = function() {
     var out = options.out;
     var newObject = options.newObject;
     var putStream = options.putStream;
-    var pdfEscapeWithNeededParanthesis = options.pdfEscapeWithNeededParanthesis;
 
     if (
       font.metadata instanceof jsPDF.API.TTFFont &&
@@ -27401,7 +27544,7 @@ WebPDecoder.prototype.getData = function() {
       out("/FontFile2 " + fontTable + " 0 R");
       out("/Flags 96");
       out("/FontBBox " + jsPDF.API.PDFObject.convert(font.metadata.bbox));
-      out("/FontName /" + pdfEscapeWithNeededParanthesis(font.fontName));
+      out("/FontName /" + toPDFName(font.fontName));
       out("/ItalicAngle " + font.metadata.italicAngle);
       out("/Ascent " + font.metadata.ascender);
       out(">>");
@@ -27416,7 +27559,7 @@ WebPDecoder.prototype.getData = function() {
         "<</Subtype/TrueType/Type/Font/ToUnicode " +
           cmap +
           " 0 R/BaseFont/" +
-          pdfEscapeWithNeededParanthesis(font.fontName) +
+          toPDFName(font.fontName) +
           "/FontDescriptor " +
           fontDescriptor +
           " 0 R" +
@@ -27482,10 +27625,10 @@ WebPDecoder.prototype.getData = function() {
                     if (Object.prototype.toString.call(text[s]) === '[object Array]') {
                         cmapConfirm = fonts[key].metadata.cmap.unicode.codeMap[strText[s][0].charCodeAt(0)]; //Make sure the cmap has the corresponding glyph id
                     } else {
-                        
+
                     }
                 //}
-                
+
             } else {
                 cmapConfirm = fonts[key].metadata.cmap.unicode.codeMap[strText[s].charCodeAt(0)]; //Make sure the cmap has the corresponding glyph id
             }*/
